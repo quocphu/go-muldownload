@@ -9,12 +9,15 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"errors"
 )
 
 const CHUNK_SIZE = 1000000
 const READ_SIZE = 100000
+const FLUSH_SIZE = 10000
 
 func makeHeader(method, host, endpoint string, headers map[string]string) string {
 	var b strings.Builder
@@ -94,23 +97,23 @@ func getSize(host, fileURL string) {
 
 }
 
-func downloadChunk(from, to int, host, file string, cb func([]byte)) {
-	rangeVal := "bytes="
-	if from > 0 {
-		rangeVal += fmt.Sprintf("%d", from)
-	}
-	rangeVal += "-"
-	if to > 0 {
-		rangeVal += fmt.Sprintf("%d", to)
-	}
+func downloadChunk(url *URL.URL, from, to int, cb func([]byte)) {
+	rangeVal := fmt.Sprintf("bytes=%d-%d", from, to)
 
 	headerFields := map[string]string{
-		"Range": rangeVal,
+		"Range":      rangeVal,
+		"Connection": "close",
+		"User-Agent": "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:74.0) Gecko/20100101 Firefox/74.0",
 	}
-	header := makeHeader("GET", host, file, headerFields)
+	header := makeHeader("GET", url.Host, url.Path, headerFields)
 
-	tcpAddr, err := net.ResolveTCPAddr("tcp4", host)
+	port := url.Port()
+	if port == "" {
+		port = "80"
+	}
+	tcpAddr, err := net.ResolveTCPAddr("tcp4", url.Host+":"+port)
 	if err != nil {
+		fmt.Println("ResolveTCPAddr error")
 		fmt.Println(err)
 	}
 
@@ -128,47 +131,39 @@ func downloadChunk(from, to int, host, file string, cb func([]byte)) {
 		return
 	}
 
-	size := to - from
-	downloadSize := 0
-
 	for {
-		readSize := size - downloadSize
-		if readSize > READ_SIZE {
-			readSize = READ_SIZE
-		}
-		body := make([]byte, readSize, readSize)
+		body := make([]byte, READ_SIZE, READ_SIZE)
 		len, err := reader.Read(body)
 		if err != nil {
-			if err == io.EOF {
-				fmt.Println("Done")
-			} else {
-				fmt.Println(err)
+			if err != io.EOF {
+				fmt.Println("downloadChunk err: ", err)
 			}
 			break
 		}
-		readSize += len
-		if len > 0 {
-			cb(body[:len])
-		}
+
+		cb(body[:len])
 	}
 }
 
-func checkAcceptMultipartDownload(uri string) (int, error) {
-	url, err := URL.Parse(uri)
-	if err != nil {
-		return 0, err
-	}
-
+func checkAcceptMultipartDownload(url *URL.URL) (int, error) {
 	h := makeHeader(
 		"HEAD",
 		url.Host,
 		url.Path,
 		map[string]string{
 			"Accept-Ranges": "bytes",
+			"Connection":    "close",
+			"User-Agent":    "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:74.0) Gecko/20100101 Firefox/74.0",
 		})
 
-	tcpAddr, err := net.ResolveTCPAddr("tcp4", url.Host)
+	port := url.Port()
+	if port == "" {
+		port = "80"
+	}
+	tcpAddr, err := net.ResolveTCPAddr("tcp4", url.Host+":"+port)
 	if err != nil {
+		fmt.Println("ResolveTCPAddr error")
+
 		return 0, err
 	}
 
@@ -179,7 +174,6 @@ func checkAcceptMultipartDownload(uri string) (int, error) {
 	reader := bufio.NewReader(conn)
 
 	header := readHeader(reader)
-	// fmt.Println(header)
 
 	if header["Accept-Ranges"] != "bytes" {
 		return 0, errors.New("Server does not support multipart download")
@@ -200,93 +194,124 @@ func calculateDownloadRange(size, part int) []int {
 		from += chunkSize
 	}
 	if from < size {
-		chunks[i-1] = chunks[i-1] + size - from
+		chunks[i-1] = chunks[i-1] + size - from + 1
 	}
+
 	return chunks
+}
+func downloadFilePart(id int, wg *sync.WaitGroup, url *URL.URL, output string, rangeFrom, rangeTo int) {
+	defer wg.Done()
+	outputPath := fmt.Sprintf("%s%d", output, id)
+	tempFile, err := os.OpenFile(outputPath, os.O_CREATE|os.O_APPEND|os.O_RDWR, 0664)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	w := bufio.NewWriter(tempFile)
+	totalSize := 0
+	tt := 0
+	start := time.Now()
+	downloadChunk(url, rangeFrom, rangeTo, func(data []byte) {
+		nn, err := w.Write(data)
+		totalSize = totalSize + nn
+		tt += nn
+		if err != nil {
+			fmt.Println(err)
+		}
+		if totalSize >= FLUSH_SIZE {
+			err = w.Flush()
+			if err != nil {
+				fmt.Println(err)
+			}
+			totalSize = 0
+		}
+	})
+	err = w.Flush()
+	if err != nil {
+		fmt.Println(err)
+	}
+	t := time.Now()
+	elapsed := t.Sub(start)
+	fmt.Printf("Part: %d \t\t Time: %f seconds \n", id, elapsed.Seconds())
 }
 
 func main() {
-	fmt.Println("hello")
+	fmt.Println("Download file as parts")
 
-	downloadRanges := calculateDownloadRange(21, 5)
-	fmt.Println(downloadRanges)
-	return
-
-	host := "localhost:3000"
-	file := "pdf24.pdf"
-	// file = "test.txt"
-	des := "http://localhost:3000/pdf24.pdf"
-
-	url, err := URL.Parse(des)
+	targetFileUrl := "https://images.pexels.com/photos/853199/pexels-photo-853199.jpeg?cs=srgb&dl=aerial-view-of-seashore-near-large-grey-rocks-853199.jpg&fm=jpg"
+	url, err := URL.Parse(targetFileUrl)
 	if err != nil {
 		fmt.Println(err)
 	}
 	fmt.Println("url host", url.Path)
 	fmt.Println("url host", url.Host)
 
-	// downloadSize := 1000000 // 1MB
-	// readSize := 10
-	fmt.Println("Host", host)
-	fmt.Println("File", file)
-	fmt.Println("---------------------")
-
-	// h := makeHeader(
-	// 	"HEAD",
-	// 	host,
-	// 	file,
-	// 	map[string]string{
-	// 		"Accept-Ranges": "bytes",
-	// 	})
-
-	// // fmt.Println("header \n", h)
-
-	// tcpAddr, err := net.ResolveTCPAddr("tcp4", host)
-	// if err != nil {
-	// 	fmt.Println(err)
-	// }
-
-	// conn, err := makeRequest(tcpAddr, h)
-	// if err != nil {
-	// 	fmt.Println(err)
-	// }
-	// reader := bufio.NewReader(conn)
-
-	// header := readHeader(reader)
-	// // fmt.Println(header)
-
-	// if header["Accept-Ranges"] != "bytes" {
-	// 	fmt.Println("Server does not support multipart download")
-	// 	os.Exit(0)
-	// }
-
-	// size, err := strconv.Atoi(header["Content-Length"])
-	size, err := checkAcceptMultipartDownload(des)
-
+	// Get file info
+	size, err := checkAcceptMultipartDownload(url)
 	if err != nil {
 		fmt.Println(err)
 		os.Exit(1)
 	}
+
 	fmt.Println("Download size: ", size)
 
-	tempFile, err := os.OpenFile("./"+file, os.O_CREATE|os.O_APPEND|os.O_RDWR, 0664)
-	w := bufio.NewWriter(tempFile)
-	totalSize := 0
-	downloadChunk(0, size, host, file, func(data []byte) {
-		fmt.Println("Dowload file ", len(data))
-		totalSize = totalSize + len(data)
-		// fmt.Println("Dowload file ", data)
-		nn, err := w.Write(data)
+	// Calculate range to download
+	parts := 5
+	downloadRanges := calculateDownloadRange(size, parts)
+	fmt.Println(downloadRanges)
+
+	// Save the target file as
+	output := "./wall_pager.jpg"
+
+	var wg sync.WaitGroup
+	for i := 0; i < parts; i++ {
+		from := downloadRanges[i*2]
+		to := downloadRanges[i*2+1]
+		wg.Add(1)
+		go func(i, from, to int) {
+			downloadFilePart(i, &wg, url, output, from, to)
+		}(i, from, to)
+	}
+	wg.Wait()
+
+	// Merge file
+	// TODO: Create binary merge
+	// round1: 1+2=a, 2+3b, 3+4=c
+	// round2: a+b=f, f+c=final
+	f0, err := os.OpenFile(output, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0664)
+	if err != nil {
+		fmt.Println(err)
+	}
+
+	start := time.Now()
+	for i := 0; i < parts; i++ {
+		fileName := fmt.Sprintf("%s%d", output, i)
+		f, err := os.Open(fileName)
 		if err != nil {
-			fmt.Println(err)
+			fmt.Println("Cant open file ")
+			return
 		}
-		fmt.Println("Write ", nn)
-		if totalSize > 100000 {
-			err = w.Flush()
+		for {
+			data := make([]byte, READ_SIZE, READ_SIZE)
+			n, err := f.Read(data)
+
 			if err != nil {
-				fmt.Println(err)
+				if err != io.EOF {
+					fmt.Println(err)
+					return
+				}
+				break
 			}
 
+			f0.Write(data[:n])
 		}
-	})
+		err = os.Remove(fileName)
+		if err != nil {
+			fmt.Println("Can not remove file ", fileName)
+		}
 
+	}
+	t := time.Now()
+	fmt.Printf("Merge files.\t\t Time: %f seconds\n", t.Sub(start).Seconds())
+	fmt.Println("Output ", output)
 }
