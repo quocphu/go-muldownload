@@ -238,13 +238,17 @@ func downloadFilePart(id int, wg *sync.WaitGroup, url *URL.URL, output string, r
 func main() {
 	fmt.Println("Download file as parts")
 
+	// URL of download file
 	targetFileUrl := "https://images.pexels.com/photos/853199/pexels-photo-853199.jpeg?cs=srgb&dl=aerial-view-of-seashore-near-large-grey-rocks-853199.jpg&fm=jpg"
+	// Save the target file as
+	output := "./wall_pager.jpg"
+
 	url, err := URL.Parse(targetFileUrl)
 	if err != nil {
 		fmt.Println(err)
 	}
-	fmt.Println("url host", url.Path)
-	fmt.Println("url host", url.Host)
+	fmt.Println("Path ", url.Path)
+	fmt.Println("Host ", url.Host)
 
 	// Get file info
 	size, err := checkAcceptMultipartDownload(url)
@@ -253,15 +257,12 @@ func main() {
 		os.Exit(1)
 	}
 
-	fmt.Println("Download size: ", size)
+	fmt.Println("Size: ", size)
 
 	// Calculate range to download
 	parts := 5
 	downloadRanges := calculateDownloadRange(size, parts)
-	fmt.Println(downloadRanges)
-
-	// Save the target file as
-	output := "./wall_pager.jpg"
+	fmt.Println("Down load ranges: ", downloadRanges)
 
 	var wg sync.WaitGroup
 	for i := 0; i < parts; i++ {
